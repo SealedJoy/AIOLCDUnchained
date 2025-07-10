@@ -1,15 +1,15 @@
-from io import BytesIO
-import time
+import usb.core
+import usb.util
 import hid
-import math
-from winusbcdc import WinUsbPy
-from typing import Tuple
+from PIL import Image, ImageDraw
 from collections import namedtuple
 from enum import Enum, IntEnum
-from PIL import Image, ImageDraw
-from q565 import encode_img
+from io import BytesIO
+import math
+import time
+from typing import Tuple
+import q565
 from utils import debounce, timing, debugUsb
-import q565_rust
 
 _NZXT_VID = 0x1E71
 _DEFAULT_TIMEOUT_MS = 1000
@@ -34,92 +34,58 @@ _COMMON_WRITE_HEADER = [
 Resolution = namedtuple("Resolution", ["width", "height"])
 
 
+#from here
+
 class RENDERING_MODE(str, Enum):
     RGBA = "RGBA"
     GIF = "GIF"
     FAST_GIF = "FAST_GIF"
     Q565 = "Q565"
 
-
 class DISPLAY_MODE(IntEnum):
     LIQUID = 2
     BUCKET = 4
     FAST_BUCKET = 5
 
-
 SUPPORTED_DEVICES = [
-    {
-        "pid": 0x3008,
-        "name": "Kraken Z3",
-        "resolution": Resolution(320, 320),
-        "renderingMode": RENDERING_MODE.RGBA,
-        "image": "http://127.0.0.1:30003/images/z3.png",
-        "totalBuckets": 16,
-        "maxBucketSize": 20 * 1024 * 1024,  # 20MB
-        "supportsLiquidMode": True,
-    },
-    {
-        "pid": 0x300C,
-        "name": "Kraken Elite",
-        "resolution": Resolution(640, 640),
-        "renderingMode": RENDERING_MODE.Q565,
-        "image": "http://127.0.0.1:30003/images/2023elite.png",
-        "totalBuckets": 16,
-        "maxBucketSize": 20 * 1024 * 1024,  # 20MB
-        "supportsLiquidMode": True,
-    },
-    {
-        "pid": 0x3012,
-        "name": "Kraken Elite v2",
-        "resolution": Resolution(640, 640),
-        "renderingMode": RENDERING_MODE.Q565,
-        "image": "http://127.0.0.1:30003/images/2023elite.png",
-        "totalBuckets": 16,
-        "maxBucketSize": 20 * 1024 * 1024,  # 20MB
-        "supportsLiquidMode": True,
-    }
+    {"pid": 0x3008, "name": "Kraken Z3", "resolution": Resolution(320, 320), "renderingMode": RENDERING_MODE.RGBA, "image": "http://127.0.0.1:30003/images/z3.png", "totalBuckets": 16, "maxBucketSize": 20 * 1024 * 1024, "supportsLiquidMode": True},
+    {"pid": 0x300C, "name": "Kraken Elite", "resolution": Resolution(640, 640), "renderingMode": RENDERING_MODE.Q565, "image": "http://127.0.0.1:30003/images/2023elite.png", "totalBuckets": 16, "maxBucketSize": 20 * 1024 * 1024, "supportsLiquidMode": True},
+    {"pid": 0x3012, "name": "Kraken Elite v2", "resolution": Resolution(640, 640), "renderingMode": RENDERING_MODE.Q565, "image": "http://127.0.0.1:30003/images/2023elite.png", "totalBuckets": 16, "maxBucketSize": 20 * 1024 * 1024, "supportsLiquidMode": True}
 ]
 
+class KrakenLCDBulk:
+    def __init__(self, vid, pid):
+        self.dev = usb.core.find(idVendor=vid, idProduct=pid)
+        if self.dev is None:
+            raise ValueError("Device not found")
+        self.dev.set_configuration()
+        cfg = self.dev.get_active_configuration()
+        intf = cfg[(0, 0)]
+        self.ep_out = usb.util.find_descriptor(
+            intf,
+            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+        )
+        if self.ep_out is None:
+            raise ValueError("Bulk OUT endpoint not found")
+    def write(self, data: bytes):
+        self.ep_out.write(data)
 
 class KrakenLCD:
-    pid: int
-    serial: str
-    name: str
-    resolution: Resolution
-    totalBuckets: int
-    maxBucketSize: int
-    maxRGBABucketSize: int
-    supportsLiquidMode: bool
-    renderingMode: RENDERING_MODE
-    lastReadMessage: bytes
-    streamReady = False
-    nextFrameBucket = 0
-    bucketsToUse = 2
-    black: Image.Image
-    mask: Image.Image
-
-    cache = None
-
     def __init__(self):
         for dev in SUPPORTED_DEVICES:
             info = hid.enumerate(_NZXT_VID, dev["pid"])
             if len(info) > 0:
                 self.hidInfo = info[0]
-                self.name = dev["name"]
-
                 self.pid = dev["pid"]
-                self.resolution: Resolution = dev["resolution"]
+                self.name = dev["name"]
+                self.resolution = dev["resolution"]
                 self.renderingMode = dev["renderingMode"]
                 self.image = dev["image"]
                 self.totalBuckets = dev["totalBuckets"]
-                self.supportsLiquidMode = dev["supportsLiquidMode"]
                 self.maxBucketSize = dev["maxBucketSize"]
-                self.maxRGBABucketSize: int = min(
-                    dev["maxBucketSize"],
-                    (self.resolution.width * self.resolution.height * 4),
-                )
+                self.maxRGBABucketSize = min(dev["maxBucketSize"], self.resolution.width * self.resolution.height * 4)
+                self.supportsLiquidMode = dev["supportsLiquidMode"]
                 self.bucketsToUse = max(self.totalBuckets, 2)
-                print()
                 break
         else:
             raise Exception("No supported device found")
@@ -128,29 +94,29 @@ class KrakenLCD:
             self.serial = self.hidInfo["serial_number"]
             self.hidDev = hid.device()
             self.hidDev.open_path(self.hidInfo["path"])
-            self.bulkDev = WinUsbPy()
-
-            for device in self.bulkDev.list_usb_devices(
-                deviceinterface=True, present=True, findparent=True
-            ):
-                if (
-                    device.path.find("vid_{:x}&pid_{:x}".format(_NZXT_VID, self.pid))
-                    != -1
-                    and device.parent
-                    and device.parent.find(self.hidInfo["serial_number"]) != -1
-                ):
-                    self.bulkDev.init_winusb_device_with_path(device.path)
-        except Exception:
-            raise Exception("Could not connect to kraken device. Is NZXT CAM closed ?")
+            self.bulkDev = KrakenLCDBulk(_NZXT_VID, self.pid)
+        except Exception as e:
+            raise Exception(f"Could not connect to kraken device: {e}")
+        
         debugUsb("found")
-
         self.black = Image.new("RGBA", self.resolution, (0, 0, 0, 0))
         self.mask = Image.new("RGBA", self.resolution, (0, 0, 0, 0))
-        maskCanvas = ImageDraw.Draw(self.mask)
-        maskCanvas.ellipse([(0, 0), self.resolution], fill=(255, 255, 255, 255))
-
+        ImageDraw.Draw(self.mask).ellipse([(0, 0), self.resolution], fill=(255, 255, 255, 255))
         self.write([0x36, 0x3])
         self.setBrightness(100)
+
+    def write(self, data):
+        self.hidDev.set_nonblocking(False)
+        padding = [0x0] * (_HID_WRITE_LENGTH - len(data))
+        res = self.hidDev.write(data + padding)
+        if res < 0:
+            raise OSError("Could not write to device")
+
+    def bulkWrite(self, data: bytes):
+        self.bulkDev.write(data)
+
+    # Retain other methods (read, readUntil, setBrightness, setLcdMode, deleteBucket, createBucket, writeRGBA, writeGIF, writeQ565, writeFrame, imageToFrame, setupStream, etc.) unchanged
+
 
     def getInfo(self):
         return {
@@ -438,7 +404,7 @@ class KrakenLCD:
             img = img.convert("RGB")
             width, height = img.size
             img_bytes = img.tobytes()
-            return q565_rust.py_encode(
+            return q565.encode_img(
                 width, height, img_bytes
             )  # encode_img(img.convert("RGB"))
         else:

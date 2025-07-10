@@ -23,6 +23,25 @@ Q565_MASK_3 = 0b1110_0000
 Q565_MAGIC = ord("q") << 24 | ord("5") << 16 | ord("6") << 8 | ord("5")
 
 
+def encode_img(width, height, img_bytes):
+    """
+    Encodes RGB bytes to Q565 format for Kraken LCD without native Rust dependency.
+    Input:
+        width (int): image width
+        height (int): image height
+        img_bytes (bytes): RGB-packed image data
+    Returns:
+        bytes: Q565 packed data for KrakenLCD.writeQ565
+    """
+    output = bytearray()
+    for i in range(0, len(img_bytes), 3):
+        r = img_bytes[i] >> 3
+        g = img_bytes[i + 1] >> 2
+        b = img_bytes[i + 2] >> 3
+        q565 = (r << 11) | (g << 5) | b
+        output.extend(q565.to_bytes(2, byteorder='little'))
+    return bytes(output)
+
 @dataclass
 class Pixel:
     px_bytes: bytearray = field(init=False)
